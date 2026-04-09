@@ -250,7 +250,7 @@ jobs:
 
             - name: Upload artifact (for Pages)
               if: ${{ !cancelled() }}
-              uses: actions/upload-pages-artifact@main
+              uses: actions/upload-pages-artifact@v4
               with:
                   path: "dist/"
 

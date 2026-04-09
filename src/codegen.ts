@@ -12,8 +12,75 @@ import type {
 } from "./projectModel";
 import { getInputComponents, toSnakeCase } from "./projectModel";
 
+const PYTHON_KEYWORDS = new Set([
+    "and",
+    "as",
+    "assert",
+    "async",
+    "await",
+    "break",
+    "class",
+    "continue",
+    "def",
+    "del",
+    "elif",
+    "else",
+    "except",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "global",
+    "if",
+    "import",
+    "in",
+    "is",
+    "lambda",
+    "none",
+    "nonlocal",
+    "not",
+    "or",
+    "pass",
+    "raise",
+    "return",
+    "true",
+    "try",
+    "while",
+    "with",
+    "yield",
+]);
+
 function escapePythonString(value: string): string {
-    return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+    return `"${value
+        .replace(/\\/g, "\\\\")
+        .replace(/\r/g, "\\r")
+        .replace(/\n/g, "\\n")
+        .replace(/"/g, '\\"')}"`;
+}
+
+function toPythonIdentifier(value: string, fallback: string): string {
+    const normalized = toSnakeCase(value);
+    const safeBase = normalized.length > 0 ? normalized : fallback;
+    const prefixed =
+        /^[a-z_]/.test(safeBase) ? safeBase : `${fallback}_${safeBase}`;
+    return PYTHON_KEYWORDS.has(prefixed) ? `${fallback}_${prefixed}` : prefixed;
+}
+
+function toPythonClassName(value: string, fallback: string): string {
+    const tokens = value
+        .trim()
+        .split(/[^a-zA-Z0-9]+/g)
+        .filter((token) => token.length > 0);
+    const baseName = tokens
+        .map((token) => token.charAt(0).toUpperCase() + token.slice(1))
+        .join("");
+    const candidate = baseName.length > 0 ? baseName : fallback;
+    const prefixed = /^[A-Za-z_]/.test(candidate)
+        ? candidate
+        : `${fallback}${candidate}`;
+    return PYTHON_KEYWORDS.has(prefixed.toLowerCase())
+        ? `Generated${prefixed}`
+        : prefixed;
 }
 
 function getDefaultValue(field: StateField): string {
@@ -32,50 +99,141 @@ function getDefaultValue(field: StateField): string {
     return '""';
 }
 
-function componentToPython(component: UIComponent, project: Project): string {
+function createFunctionNameMap(project: Project): Map<string, string> {
+    const functionNames = new Map<string, string>();
+    const usedNames = new Set<string>();
+    project.pages.forEach((page, index) => {
+        if (index === 0) {
+            functionNames.set(page.id, "index");
+            usedNames.add("index");
+            return;
+        }
+        const baseName = toFunctionName(page.name);
+        let candidateName = baseName === "index" ? "page_index" : baseName;
+        let suffix = 2;
+        while (usedNames.has(candidateName)) {
+            candidateName = `${baseName}_${suffix}`;
+            suffix += 1;
+        }
+        functionNames.set(page.id, candidateName);
+        usedNames.add(candidateName);
+    });
+    return functionNames;
+}
+
+function createClassNameMap(project: Project): {
+    primaryStateName: string;
+    secondaryClassNames: Map<string, string>;
+} {
+    const usedNames = new Set<string>();
+    const primaryStateName = toPythonClassName(
+        project.stateModel.primaryName,
+        "AppState",
+    );
+    usedNames.add(primaryStateName);
+    const secondaryClassNames = new Map<string, string>();
+    project.stateModel.secondaryClasses.forEach((secondaryClass, index) => {
+        const baseName = toPythonClassName(
+            secondaryClass.name,
+            `NestedRecord${index + 1}`,
+        );
+        let candidateName = baseName;
+        let suffix = 2;
+        while (usedNames.has(candidateName)) {
+            candidateName = `${baseName}${suffix}`;
+            suffix += 1;
+        }
+        secondaryClassNames.set(secondaryClass.id, candidateName);
+        usedNames.add(candidateName);
+    });
+    return { primaryStateName, secondaryClassNames };
+}
+
+function componentToPython(
+    component: UIComponent,
+    currentPage: PageNode,
+    project: Project,
+    functionNames: Map<string, string>,
+): string {
     switch (component.type) {
         case "Text":
-            return `Text(${escapePythonString(component.content)})`;
+            return escapePythonString(component.content);
         case "Header":
             return `Header(${escapePythonString(component.content)}, ${component.level})`;
         case "TextBox":
             return `TextBox(${escapePythonString(
-                component.name,
+                toPythonIdentifier(component.name, "field"),
             )}, ${escapePythonString(component.defaultValue)})`;
         case "TextArea":
             return `TextArea(${escapePythonString(
-                component.name,
+                toPythonIdentifier(component.name, "field"),
             )}, ${escapePythonString(component.defaultValue)})`;
         case "CheckBox":
-            return `CheckBox(${escapePythonString(component.name)}, ${
-                component.defaultValue ? "True" : "False"
-            })`;
+            return `CheckBox(${escapePythonString(
+                toPythonIdentifier(component.name, "field"),
+            )}, ${component.defaultValue ? "True" : "False"})`;
         case "SelectBox":
             return `SelectBox(${escapePythonString(
-                component.name,
+                toPythonIdentifier(component.name, "field"),
             )}, [${component.options
                 .map((option) => escapePythonString(option))
                 .join(", ")}], ${escapePythonString(component.defaultValue)})`;
         case "Button":
-            return buildButtonPython(component, project.routes, project.pages);
+            return buildButtonPython(
+                component,
+                currentPage,
+                project.routes,
+                project.pages,
+                functionNames,
+            );
     }
 }
 
 function buildButtonPython(
     component: ButtonComponent,
+    currentPage: PageNode,
     routes: RouteDefinition[],
     pages: PageNode[],
+    functionNames: Map<string, string>,
 ): string {
     const route = routes.find((candidate) => candidate.id === component.routeId);
     const targetPage = pages.find((page) => page.id === route?.targetPageId);
     const targetName =
-        targetPage !== undefined ? toFunctionName(targetPage.name) : "missing_route";
+        targetPage !== undefined
+            ? (functionNames.get(targetPage.id) ?? "index")
+            : (functionNames.get(currentPage.id) ?? "index");
     return `Button(${escapePythonString(component.label)}, ${targetName})`;
 }
 
 function toFunctionName(value: string): string {
-    const snakeCase = toSnakeCase(value);
-    return /^[a-z]/.test(snakeCase) ? snakeCase : `page_${snakeCase}`;
+    return toPythonIdentifier(value, "page");
+}
+
+function resolvePythonType(
+    rawType: string,
+    project: Project,
+    secondaryClassNames: Map<string, string>,
+): string {
+    const normalizedType = rawType.trim();
+    if (normalizedType.length === 0) {
+        return "str";
+    }
+    const directMatch = project.stateModel.secondaryClasses.find(
+        (secondaryClass) => secondaryClass.name === normalizedType,
+    );
+    if (directMatch !== undefined) {
+        return secondaryClassNames.get(directMatch.id) ?? normalizedType;
+    }
+    if (normalizedType.startsWith("list[") && normalizedType.endsWith("]")) {
+        const innerType = normalizedType.slice(5, -1).trim();
+        const nestedMatch = project.stateModel.secondaryClasses.find(
+            (secondaryClass) => secondaryClass.name === innerType,
+        );
+        if (nestedMatch !== undefined) {
+            return `list[${secondaryClassNames.get(nestedMatch.id) ?? innerType}]`;
+        }
+    }
+    return normalizedType;
 }
 
 function getRouteParameters(page: PageNode, project: Project): string[] {
@@ -91,7 +249,7 @@ function getRouteParameters(page: PageNode, project: Project): string[] {
             return;
         }
         getInputComponents(sourcePage).forEach((component) => {
-            const parameterName = toSnakeCase(component.name);
+            const parameterName = toPythonIdentifier(component.name, "field");
             const parameterValue = buildParameterValue(component);
             parameterMap.set(parameterName, parameterValue);
         });
@@ -110,9 +268,6 @@ function buildParameterValue(
 ): string {
     if (component.type === "CheckBox") {
         return `bool = ${component.defaultValue ? "True" : "False"}`;
-    }
-    if (component.type === "TextBox" || component.type === "TextArea") {
-        return `str = ${escapePythonString(component.defaultValue)}`;
     }
     return `str = ${escapePythonString(component.defaultValue)}`;
 }
@@ -143,16 +298,27 @@ function buildAnnotationComments(page: PageNode, project: Project): string[] {
     return [...pageComments, ...incomingRouteComments];
 }
 
-function buildPageFunction(page: PageNode, project: Project): string {
-    const functionName = toFunctionName(page.name);
+function buildPageFunction(
+    page: PageNode,
+    project: Project,
+    functionNames: Map<string, string>,
+    primaryStateName: string,
+): string {
+    const functionName = functionNames.get(page.id) ?? "index";
     const parameters = getRouteParameters(page, project);
     const signature =
         parameters.length > 0
-            ? `state: ${project.stateModel.primaryName}, ${parameters.join(", ")}`
-            : `state: ${project.stateModel.primaryName}`;
+            ? `state: ${primaryStateName}, ${parameters.join(", ")}`
+            : `state: ${primaryStateName}`;
     const commentLines = buildAnnotationComments(page, project);
     const componentLines = page.components.map(
-        (component) => `            ${componentToPython(component, project)},`,
+        (component) =>
+            `            ${componentToPython(
+                component,
+                page,
+                project,
+                functionNames,
+            )},`,
     );
     const commentBlock = commentLines.length > 0 ? `${commentLines.join("\n")}\n` : "";
     return `@route
@@ -166,48 +332,80 @@ ${componentLines.join("\n")}
     )`;
 }
 
-function buildSecondaryClass(className: Project["stateModel"]["secondaryClasses"][number]): string {
+function buildSecondaryClassWithNames(
+    className: Project["stateModel"]["secondaryClasses"][number],
+    naming: {
+        primaryStateName: string;
+        secondaryClassNames: Map<string, string>;
+    },
+    project: Project,
+): string {
     const fieldLines = className.fields.map(
         (field) =>
-            `    ${toSnakeCase(field.name)}: ${field.type} = ${getDefaultValue({
+            `    ${toPythonIdentifier(field.name, "field")}: ${resolvePythonType(
+                field.type,
+                project,
+                naming.secondaryClassNames,
+            )} = ${getDefaultValue({
                 id: field.id,
                 name: field.name,
-                type: field.type,
+                type: resolvePythonType(
+                    field.type,
+                    project,
+                    naming.secondaryClassNames,
+                ),
                 description: field.description,
                 updatedByPageIds: [],
                 updatedByRouteIds: [],
             })}`,
     );
     return `@dataclass
-class ${className.name}:
+class ${naming.secondaryClassNames.get(className.id) ?? "NestedRecord"}:
     """${className.description}"""
 ${fieldLines.join("\n")}`;
 }
 
-function buildPrimaryState(project: Project): string {
+function buildPrimaryState(
+    project: Project,
+    naming: {
+        primaryStateName: string;
+        secondaryClassNames: Map<string, string>;
+    },
+): string {
     const fieldLines = project.stateModel.primaryFields.map(
         (field) =>
-            `    ${toSnakeCase(field.name)}: ${field.type} = ${getDefaultValue(field)}`,
+            `    ${toPythonIdentifier(field.name, "field")}: ${resolvePythonType(
+                field.type,
+                project,
+                naming.secondaryClassNames,
+            )} = ${getDefaultValue({
+                ...field,
+                type: resolvePythonType(
+                    field.type,
+                    project,
+                    naming.secondaryClassNames,
+                ),
+            })}`,
     );
     return `@dataclass
-class ${project.stateModel.primaryName}:
+class ${naming.primaryStateName}:
     """Primary application state for ${project.name}."""
 ${fieldLines.join("\n")}`;
 }
 
 export function buildPythonStarter(project: Project): string {
+    const functionNames = createFunctionNameMap(project);
+    const naming = createClassNameMap(project);
     const imports = [
         "from dataclasses import dataclass, field",
-        "from drafter import Button, CheckBox, Header, Page, SelectBox, Text, TextArea, TextBox, route, start_server",
+        "from drafter import *",
     ];
     const secondaryClasses = project.stateModel.secondaryClasses.map((item) =>
-        buildSecondaryClass(item),
+        buildSecondaryClassWithNames(item, naming, project),
     );
-    const pageFunctions = project.pages.map((page) => buildPageFunction(page, project));
-    const rootFunction =
-        project.pages.length > 0
-            ? toFunctionName(project.pages[0].name)
-            : "home_page";
+    const pageFunctions = project.pages.map((page) =>
+        buildPageFunction(page, project, functionNames, naming.primaryStateName),
+    );
     const routeNotes = project.routes.map((route) => {
         const sourcePage = project.pages.find(
             (page) => page.id === route.sourcePageId,
@@ -225,12 +423,12 @@ export function buildPythonStarter(project: Project): string {
         "",
         ...secondaryClasses,
         ...(secondaryClasses.length > 0 ? [""] : []),
-        buildPrimaryState(project),
+        buildPrimaryState(project, naming),
         "",
         ...routeNotes,
         ...(routeNotes.length > 0 ? [""] : []),
         ...pageFunctions,
         "",
-        `start_server(${rootFunction})`,
+        `start_server(${naming.primaryStateName}())`,
     ].join("\n");
 }
